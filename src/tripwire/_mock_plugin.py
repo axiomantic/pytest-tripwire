@@ -248,7 +248,11 @@ class MethodProxy:
             config = self._sticky_config
 
         if config is None:
-            if self._consumed_count > 0:
+            # Queue exhausted: only show the queue-exhausted hint when no other
+            # fallback (spy/wraps, sticky) is configured. This preserves the
+            # pre-existing spy/wraps delegation behavior when a wraps target is
+            # set, even after the user has consumed all queue entries.
+            if self._consumed_count > 0 and not is_spy:
                 raise UnmockedInteractionError(
                     source_id=self.source_id,
                     args=args,
@@ -472,6 +476,18 @@ class _BaseMock:
 
     def calls(self, fn: Callable[..., Any]) -> "_BaseMock":
         self.__getattr__("__call__").calls(fn)
+        return self
+
+    def always_returns(self, value: Any) -> "_BaseMock":  # noqa: ANN401
+        self.__getattr__("__call__").always_returns(value)
+        return self
+
+    def always_raises(self, exc: BaseException | type[BaseException]) -> "_BaseMock":
+        self.__getattr__("__call__").always_raises(exc)
+        return self
+
+    def always_calls(self, fn: Callable[..., Any]) -> "_BaseMock":
+        self.__getattr__("__call__").always_calls(fn)
         return self
 
     def assert_call(self, **kwargs: Any) -> None:  # noqa: ANN401

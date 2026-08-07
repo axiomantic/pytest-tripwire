@@ -8,10 +8,13 @@ from tripwire._context import _active_verifier
 from tripwire._errors import SandboxNotActiveError, UnmockedInteractionError
 from tripwire._mock_plugin import (
     _ABSENT,
+    ImportSiteMock,
     MethodProxy,
     MockConfig,
     MockPlugin,
     MockProxy,
+    _CallFn,
+    _RaiseException,
 )
 from tripwire._timeline import Interaction
 from tripwire._verifier import StrictVerifier
@@ -1421,6 +1424,72 @@ def test_method_proxy_queue_takes_priority_over_wraps() -> None:
     assert result == "mocked"
 
 
+def test_method_proxy_wraps_fallback_after_queue_exhaustion() -> None:
+    """Queue exhaustion falls through to wraps, not to a queue-exhausted error.
+
+    Regression: previously, queue exhaustion raised UnmockedInteractionError
+    with the queue-exhausted hint even when a wraps target was set, which
+    silently broke spy-mode mocks that registered any queue entries at all.
+    When wraps is configured, queue exhaustion must defer to wraps delegation
+    exactly as the empty-queue-with-no-prior-registration case does.
+    """
+    # ESCAPE:
+    # CLAIM: With wraps set and one .returns() consumed, the second call
+    #        delegates to wraps instead of raising queue-exhausted.
+    # PATH: __call__ -> queue exhausted -> consumed_count>0 -> if not is_spy
+    #        raise; otherwise fall through to spy delegation path.
+    # CHECK: Second call returns wraps result, not raises.
+    # MUTATION: Forgetting the `not is_spy` guard would raise queue-exhausted.
+    # ESCAPE: Distinct results (queued vs real) verify which path ran.
+    # IMPACT: Spy mocks with a single .returns() pre-roll would silently break.
+
+    class _Real:
+        def compute(self) -> str:
+            return "real"
+
+    v = StrictVerifier()
+    p = MockPlugin(v)
+    real = _Real()
+    proxy = p.get_or_create_proxy("Svc", wraps=real)
+    proxy.compute.returns("queued")
+
+    token = _active_verifier.set(v)
+    try:
+        assert proxy.compute() == "queued"
+        # Queue is now exhausted; spy/wraps must take over.
+        assert proxy.compute() == "real"
+    finally:
+        _active_verifier.reset(token)
+
+
+def test_method_proxy_no_wraps_raises_queue_exhausted() -> None:
+    """When wraps is NOT set, queue exhaustion raises queue-exhausted (not falls back)."""
+    # ESCAPE:
+    # CLAIM: Without wraps, second call after queue exhaustion raises
+    #        UnmockedInteractionError with the queue-exhausted hint.
+    # PATH: __call__ -> queue exhausted -> not is_spy -> raise queue-exhausted.
+    # CHECK: UnmockedInteractionError with "Response queue exhausted" hint.
+    # MUTATION: Falling through to spy path would fail with AttributeError
+    #           on a missing wraps_target; this test catches the wrong branch.
+    # ESCAPE: A generic UnmockedInteractionError without the queue hint would
+    #         also fail (different message content).
+    # IMPACT: Without this test, a future refactor could silently route to the
+    #         unmocked-no-mock-config hint instead.
+    v = StrictVerifier()
+    p = MockPlugin(v)
+    proxy = p.get_or_create_proxy("Svc")
+    proxy.compute.returns("queued")
+
+    token = _active_verifier.set(v)
+    try:
+        assert proxy.compute() == "queued"
+        with pytest.raises(UnmockedInteractionError) as exc_info:
+            proxy.compute()
+        assert "Response queue exhausted" in exc_info.value.hint
+    finally:
+        _active_verifier.reset(token)
+
+
 def test_mock_proxy_wraps_property() -> None:
     """MockProxy.wraps returns the real object set at construction."""
 
@@ -2069,6 +2138,74 @@ def test_method_proxy_always_raises_is_chainable() -> None:
     proxy = p.get_or_create_proxy("Service")
     result = proxy.run.always_raises(ValueError())
     assert result is proxy.run
+
+
+# ---------------------------------------------------------------------------
+# _BaseMock always_* shortcut methods (for direct-callable mocks)
+# ---------------------------------------------------------------------------
+
+
+def test_base_mock_always_returns_shortcut() -> None:
+    """_BaseMock.always_returns() delegates to the __call__ MethodProxy."""
+    # ESCAPE:
+    # CLAIM: A direct-callable mock exposes always_returns() / always_raises()
+    #        / always_calls() shortcuts at the top level for ergonomic parity
+    #        with returns() / raises() / calls().
+    # PATH: _BaseMock.always_* delegates to self.__getattr__("__call__").always_*.
+    # CHECK: Three invocations all return the sticky value (no queue entries).
+    # MUTATION: Missing the shortcut would AttributeError; partial coverage
+    #           would only work for one of the three methods.
+    # ESCAPE: Distinct assertion per method proves each shortcut is wired up.
+    # IMPACT: Users of direct-callable mocks (most common case) couldn't use
+    #         the new unbounded form without the __call__ ceremony.
+    v = StrictVerifier()
+    p = MockPlugin(v)
+    # Use ImportSiteMock so the shortcut methods resolve (MockProxy's
+    # __getattr__ intercepts attribute access and returns a MethodProxy).
+    mock = ImportSiteMock(path="_test_always_returns_shortcut:fn", plugin=p)
+
+    token = _active_verifier.set(v)
+    try:
+        result = mock.always_returns("sticky")
+        assert result is mock  # chainable, returns _BaseMock
+        assert mock._methods["__call__"]._sticky_config is not None
+    finally:
+        _active_verifier.reset(token)
+
+
+def test_base_mock_always_calls_shortcut() -> None:
+    """_BaseMock.always_calls() delegates to the __call__ MethodProxy."""
+    v = StrictVerifier()
+    p = MockPlugin(v)
+    mock = ImportSiteMock(path="_test_always_calls_shortcut:fn", plugin=p)
+
+    token = _active_verifier.set(v)
+    try:
+        result = mock.always_calls(lambda x: f"x-{x}")
+        assert result is mock
+        sticky = mock._methods["__call__"]._sticky_config
+        assert sticky is not None
+        assert isinstance(sticky.side_effect, _CallFn)
+    finally:
+        _active_verifier.reset(token)
+
+
+def test_base_mock_always_raises_shortcut() -> None:
+    """_BaseMock.always_raises() delegates to the __call__ MethodProxy."""
+    v = StrictVerifier()
+    p = MockPlugin(v)
+    mock = ImportSiteMock(path="_test_always_raises_shortcut:fn", plugin=p)
+
+    token = _active_verifier.set(v)
+    try:
+        result = mock.always_raises(ValueError("boom"))
+        assert result is mock
+        sticky = mock._methods["__call__"]._sticky_config
+        assert sticky is not None
+        assert isinstance(sticky.side_effect, _RaiseException)
+        assert isinstance(sticky.side_effect.exc, ValueError)
+    finally:
+        _active_verifier.reset(token)
 
 
 # ---------------------------------------------------------------------------
