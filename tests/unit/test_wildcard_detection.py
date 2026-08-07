@@ -114,3 +114,36 @@ def test_all_wildcard_detection_in_any_order():
                 body=AnyThing(),
                 require_response=False,
             )
+
+
+
+def test_bare_anything_class_is_detected():
+    """Bare AnyThing class (no parentheses) must also trigger AllWildcardAssertionError."""
+    tripwire.http.mock_response("GET", "http://test/api", json={"ok": True})
+    with tripwire:
+        httpx.get("http://test/api")
+
+    with pytest.raises(AllWildcardAssertionError, match="verifies nothing"):
+        tripwire.http.assert_request(
+            method=AnyThing,
+            url=AnyThing,
+            headers=AnyThing,
+            body=AnyThing,
+            require_response=False,
+        )
+
+
+def test_bare_anything_with_partial_wildcard_allowed():
+    """Bare AnyThing used alongside real values must NOT trigger the guard."""
+    tripwire.http.mock_response("GET", "http://test/api", json={"ok": True})
+    with tripwire:
+        httpx.get("http://test/api")
+
+    # Should NOT raise — only some fields are wildcards
+    tripwire.http.assert_request(
+        method="GET",
+        url=AnyThing,
+        headers=AnyThing,
+        body=AnyThing,
+        require_response=False,
+    )
