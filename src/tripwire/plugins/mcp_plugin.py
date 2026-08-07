@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import traceback
+import warnings
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -379,6 +380,9 @@ class McpPlugin(BasePlugin):
     _original_read_resource: ClassVar[Callable[..., Any] | None] = None
     _original_get_prompt: ClassVar[Callable[..., Any] | None] = None
     _original_handle_request: ClassVar[Callable[..., Any] | None] = None
+    # True when mcp >= 2.0.0 (or any version that removed Server._handle_request)
+    # is installed and the server-side shim cannot be monkeypatched.
+    _server_patches_disabled: ClassVar[bool] = False
 
     def __init__(self, verifier: StrictVerifier) -> None:
         super().__init__(verifier)
@@ -510,7 +514,18 @@ class McpPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def install_patches(self) -> None:
-        """Install MCP client/server patches."""
+        """Install MCP client/server patches.
+
+        Compatibility note: MCP >= 2.0.0 replaced ``Server._handle_request`` (a
+        coroutine method that could be monkeypatched at the class level) with a
+        middleware-based dispatcher in ``mcp.server.runner``. The four client/
+        server handlers this plugin relies on (``call_tool``, ``read_resource``,
+        ``get_prompt``) remain patchable on both versions, but the server-side
+        ``_handle_request`` shim cannot be installed against MCP >= 2.0.0. When
+        that attribute is missing, we install the client patches and emit a
+        warning so users with MCP >= 2.0.0 keep their plugin working for client
+        calls while understanding that server-side interception is disabled.
+        """
         if not _MCP_AVAILABLE:
             raise ImportError(
                 "Install pytest-tripwire[mcp] to use McpPlugin: pip install pytest-tripwire[mcp]"
@@ -518,12 +533,25 @@ class McpPlugin(BasePlugin):
         McpPlugin._original_call_tool = _ClientSession.call_tool
         McpPlugin._original_read_resource = _ClientSession.read_resource
         McpPlugin._original_get_prompt = _ClientSession.get_prompt
-        McpPlugin._original_handle_request = _Server._handle_request
+        handle_request = getattr(_Server, "_handle_request", None)
+        if handle_request is None:
+            warnings.warn(
+                "McpPlugin: Server._handle_request not found on installed mcp package; "
+                "server-side MCP interception disabled. Client-side patches "
+                "(call_tool, read_resource, get_prompt) are still installed. "
+                "This is expected on mcp >= 2.0.0.",
+                stacklevel=2,
+            )
+            McpPlugin._server_patches_disabled = True
+        else:
+            McpPlugin._original_handle_request = handle_request
+            McpPlugin._server_patches_disabled = False
 
         setattr(_ClientSession, "call_tool", _patched_call_tool)
         setattr(_ClientSession, "read_resource", _patched_read_resource)
         setattr(_ClientSession, "get_prompt", _patched_get_prompt)
-        setattr(_Server, "_handle_request", _patched_handle_request)
+        if not McpPlugin._server_patches_disabled:
+            setattr(_Server, "_handle_request", _patched_handle_request)
 
     def restore_patches(self) -> None:
         """Restore original MCP client/server functions."""
@@ -539,6 +567,7 @@ class McpPlugin(BasePlugin):
         if McpPlugin._original_handle_request is not None:
             setattr(_Server, "_handle_request", McpPlugin._original_handle_request)
             McpPlugin._original_handle_request = None
+        McpPlugin._server_patches_disabled = False
 
     # ------------------------------------------------------------------
     # BasePlugin abstract method implementations

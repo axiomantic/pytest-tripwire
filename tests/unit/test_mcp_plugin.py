@@ -149,6 +149,73 @@ def test_reference_counting_nested() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Compatibility: mcp >= 2.0.0 removed Server._handle_request
+# ---------------------------------------------------------------------------
+
+
+def test_install_patches_tolerates_missing_handle_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """install_patches() succeeds when Server._handle_request is absent (mcp >= 2.0.0).
+
+    Regression: prior versions raised AttributeError at sandbox activation time,
+    which made every tripwire test that entered a sandbox fail in environments
+    with mcp >= 2.0.0 installed. The fix is to detect the missing attribute,
+    install the client-side patches, and emit a warning rather than crash.
+    """
+    import tripwire.plugins.mcp_plugin as mcp_mod
+
+    original_server = mcp_mod._Server
+
+    class _ServerWithoutHandleRequest:
+        # Mirror what real mcp.Server looks like on >= 2.0.0: no _handle_request.
+        pass
+
+    monkeypatch.setattr(mcp_mod, "_Server", _ServerWithoutHandleRequest)
+
+    with pytest.warns(UserWarning, match="server-side MCP interception disabled"):
+        v, p = _make_verifier_with_plugin()
+        p.activate()
+        try:
+            assert McpPlugin._server_patches_disabled is True
+            # Client-side patches are still installed
+            assert McpPlugin._original_call_tool is not None
+            assert McpPlugin._original_handle_request is None
+        finally:
+            p.deactivate()
+            McpPlugin._original_call_tool = None
+
+    # restore_patches() resets the flag.
+    assert McpPlugin._server_patches_disabled is False
+
+    # Restore the original _Server reference for subsequent tests.
+    monkeypatch.setattr(mcp_mod, "_Server", original_server)
+
+
+def test_install_patches_with_handle_request_keeps_server_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Server._handle_request exists, the server patch is installed as before."""
+    import tripwire.plugins.mcp_plugin as mcp_mod
+
+    original_server = mcp_mod._Server
+    original_handle_request = getattr(original_server, "_handle_request", None)
+    if original_handle_request is None:
+        pytest.skip("Test only meaningful when _handle_request is available")
+
+    with pytest.warns(None) as record:
+        v, p = _make_verifier_with_plugin()
+        p.activate()
+        try:
+            assert McpPlugin._server_patches_disabled is False
+            assert McpPlugin._original_handle_request is original_handle_request
+        finally:
+            p.deactivate()
+
+    assert not any("server-side MCP interception disabled" in str(w.message) for w in record)
+
+
+# ---------------------------------------------------------------------------
 # Basic client call_tool mock + assert
 # ---------------------------------------------------------------------------
 
