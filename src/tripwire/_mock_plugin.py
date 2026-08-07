@@ -83,6 +83,8 @@ class MethodProxy:
         self._plugin = plugin
         self._proxy = proxy
         self._config_queue: deque[MockConfig] = deque()
+        self._consumed_count: int = 0
+        self._sticky_config: MockConfig | None = None
         self.source_id = f"mock:{mock_name}.{method_name}"
         self._next_required: bool = True  # sticky flag for subsequent configurations
 
@@ -124,6 +126,51 @@ class MethodProxy:
                 side_effect=_CallFn(fn),
                 required=self._next_required,
             )
+        )
+        return self
+
+    def always_returns(self, value: Any) -> "MethodProxy":  # noqa: ANN401
+        """Set a sticky return value used for every invocation after the queue is exhausted.
+
+        Unlike .returns(), which appends one entry to the FIFO queue, this
+        sets an unbounded fallback that is used for *every* call once the
+        configured queue entries are consumed.
+        """
+        self._sticky_config = MockConfig(
+            mock_name=self._mock_name,
+            method_name=self._method_name,
+            side_effect=_ReturnValue(value),
+            required=self._next_required,
+        )
+        return self
+
+    def always_raises(self, exc: BaseException | type[BaseException]) -> "MethodProxy":
+        """Set a sticky exception used for every invocation after the queue is exhausted.
+
+        Unlike .raises(), which appends one entry to the FIFO queue, this
+        sets an unbounded fallback that is used for *every* call once the
+        configured queue entries are consumed.
+        """
+        self._sticky_config = MockConfig(
+            mock_name=self._mock_name,
+            method_name=self._method_name,
+            side_effect=_RaiseException(exc),
+            required=self._next_required,
+        )
+        return self
+
+    def always_calls(self, fn: Callable[..., Any]) -> "MethodProxy":
+        """Set a sticky callable used for every invocation after the queue is exhausted.
+
+        Unlike .calls(), which appends one entry to the FIFO queue, this
+        sets an unbounded fallback that is used for *every* call once the
+        configured queue entries are consumed.
+        """
+        self._sticky_config = MockConfig(
+            mock_name=self._mock_name,
+            method_name=self._method_name,
+            side_effect=_CallFn(fn),
+            required=self._next_required,
         )
         return self
 
@@ -189,11 +236,27 @@ class MethodProxy:
         # Step 1: Verify sandbox is active (raises SandboxNotActiveError if not)
         get_verifier_or_raise(self.source_id)
 
-        # Step 2: Check side-effect queue; fall back to spy delegation if empty
+        # Step 2: Determine the config (queue, sticky, or none)
         is_spy = self._get_spy_flag()
         wraps_target = self._get_wraps_target()
 
-        if not self._config_queue:
+        config: MockConfig | None = None
+        if self._config_queue:
+            config = self._config_queue.popleft()
+            self._consumed_count += 1
+        elif self._sticky_config is not None:
+            config = self._sticky_config
+
+        if config is None:
+            if self._consumed_count > 0:
+                raise UnmockedInteractionError(
+                    source_id=self.source_id,
+                    args=args,
+                    kwargs=kwargs,
+                    hint=self._plugin.format_queue_exhausted_hint(
+                        self.source_id, self._consumed_count, args, kwargs
+                    ),
+                )
             if not is_spy or wraps_target is None:
                 raise UnmockedInteractionError(
                     source_id=self.source_id,
@@ -235,8 +298,6 @@ class MethodProxy:
                 interaction.enforce = self._get_enforce()
                 self._plugin.record(interaction)
             return result
-
-        config = self._config_queue.popleft()
 
         # Step 3: Record the interaction (with raised in details if applicable)
         details_dict: dict[str, Any] = {
@@ -625,7 +686,7 @@ class MockPlugin(BasePlugin):
         """Copy-pasteable code snippet for mocking a call that had no side effect."""
         # source_id = "mock:Name.method"
         without_prefix = source_id.replace("mock:", "", 1)
-        parts = without_prefix.split(".", 1)
+        parts = without_prefix.rsplit(".", 1)
         mock_name = parts[0] if len(parts) > 0 else "?"
         method_name = parts[1] if len(parts) > 1 else "?"
         return (
@@ -633,6 +694,31 @@ class MockPlugin(BasePlugin):
             f"  Called with: args={args!r}, kwargs={kwargs!r}\n\n"
             f"  To mock this interaction, add before your sandbox:\n"
             f'    tripwire.mock("{mock_name}").{method_name}.returns(<value>)\n\n'
+            f"  Or to mark it optional:\n"
+            f'    tripwire.mock("{mock_name}").{method_name}.required(False).returns(<value>)'
+        )
+
+    def format_queue_exhausted_hint(
+        self,
+        source_id: str,
+        consumed_count: int,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> str:
+        """Hint for when the side-effect queue has been exhausted."""
+        without_prefix = source_id.replace("mock:", "", 1)
+        parts = without_prefix.rsplit(".", 1)
+        mock_name = parts[0] if len(parts) > 0 else "?"
+        method_name = parts[1] if len(parts) > 1 else "?"
+        return (
+            f"Response queue exhausted for mock '{mock_name}.{method_name}'.\n\n"
+            f"  {consumed_count} response(s) registered and consumed; "
+            f"this is invocation {consumed_count + 1}.\n"
+            f"  Called with: args={args!r}, kwargs={kwargs!r}\n\n"
+            f"  To allow more invocations, register additional responses before the sandbox:\n"
+            f'    tripwire.mock("{mock_name}").{method_name}.returns(<value>)\n\n'
+            f"  Or use .always_returns() / .always_calls() for an unbounded replacement:\n"
+            f'    tripwire.mock("{mock_name}").{method_name}.always_returns(<value>)\n\n'
             f"  Or to mark it optional:\n"
             f'    tripwire.mock("{mock_name}").{method_name}.required(False).returns(<value>)'
         )

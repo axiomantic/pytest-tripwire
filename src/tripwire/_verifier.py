@@ -421,7 +421,7 @@ class StrictVerifier:
             from dirty_equals import AnyThing  # noqa: PLC0415
         except ImportError:
             return False
-        return all(isinstance(v, AnyThing) for v in expected.values())
+        return all(v is AnyThing or isinstance(v, AnyThing) for v in expected.values())
 
     def _format_unasserted_error(self, unasserted: list[Interaction]) -> str:
         lines = [f"{len(unasserted)} interaction(s) were not asserted", ""]
