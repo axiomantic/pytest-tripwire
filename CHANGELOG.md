@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.1] - 2026-08-07
+
+### Fixed
+- **Bare `AnyThing` class bypassed the all-wildcard guard.** `StrictVerifier._all_wildcards()` only checked `isinstance(v, AnyThing)`, but a class is not an instance of itself, so the bare form `AnyThing` (without parentheses) — which `dirty_equals` makes compare equal to everything via `DirtyEqualsMeta.__eq__` — silently passed any assertion. Widen the predicate to also check `v is AnyThing`. Closes the gap in the guard added in #48.
+- **`format_unmocked_hint()` rendered malformed dotted mock paths.** The hint split `source_id` on the first dot (`mock:pkg.svc:fetch.__call__` → `mock_name="pkg"`), producing `tripwire.mock("pkg").svc:fetch.__call__.returns(...)` — not valid Python and pointing at the wrong module. Use `rsplit(".", 1)` so the hint matches the documented form.
+- **Queue exhaustion error message misled users.** When a mock's side-effect queue was exhausted after the registered entries were consumed, `UnmockedInteractionError` said "Add a mock before entering the sandbox" — false when a mock *was* registered and had already fired. Track `_consumed_count` on `MethodProxy` and emit a specific `format_queue_exhausted_hint` naming the consumed count, the next invocation number, and the new `.always_returns()` unbounded option.
+- **`McpPlugin` crashed on `mcp >= 2.0.0`.** MCP 2.0.0 replaced the patchable `Server._handle_request` coroutine with a middleware-based dispatcher in `mcp.server.runner`, so `install_patches()` raised `AttributeError` on every sandbox entry — cascading into hundreds of apparently unrelated test failures in environments with `mcp >= 2.0.0` installed. Detect the missing attribute, install the three client-side patches (`call_tool`, `read_resource`, `get_prompt`) as before, emit a `UserWarning`, and skip the server-side shim. Server-side interception will need a separate rework against the new middleware pipeline.
+- **Queue exhaustion silently blocked `spy`/`wraps` delegation.** After the queue-exhausted-error refactor, mocks with `wraps` set and any `.returns()` pre-roll raised `UnmockedInteractionError` instead of falling through to `wraps`. Restore the pre-existing behavior: when `is_spy` is true, queue exhaustion falls through to wraps delegation, only raising the queue-exhausted hint when neither sticky nor spy/wraps can satisfy the call.
+
+### Added
+- **`MethodProxy.always_returns()` / `always_raises()` / `always_calls()`.** Sticky fallback configs applied to every invocation once the FIFO queue is exhausted. The queue still takes priority; sticky only kicks in after all configured entries are consumed. Mirrors the `unittest.mock` `side_effect=fn` "replace this function for the duration of the sandbox" idiom without requiring the call count in advance.
+- **`_BaseMock.always_returns()` / `always_raises()` / `always_calls()` shortcut methods.** Top-level shortcuts on `ImportSiteMock` / `ObjectMock` mirroring the existing `returns`/`raises`/`calls` shortcuts. Direct-callable mocks get the new unbounded form without having to write `.__call__.always_returns(...)`.
+
 ## [0.21.0] - 2026-04-30
 
 ### Changed
